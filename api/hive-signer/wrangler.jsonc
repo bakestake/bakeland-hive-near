@@ -1,0 +1,33 @@
+// bakeland-hive-signer: holds the Hive Link escrow key and sends wrapped NEAR for bakeland-api's settlement sweep
+// (cloudflare/hive-signer/signer.js). No public URL: only Workers with a service binding to it can call it.
+// Secret (set with `wrangler secret put ESCROW_SECRET_KEY -c cloudflare/hive-signer/wrangler.jsonc`, never here):
+//   ESCROW_SECRET_KEY  the escrow account's full-access ed25519 secret key ("ed25519:...").
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "bakeland-hive-signer",
+  "main": "signer.js",
+  "account_id": "<your-cloudflare-account-id>",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "durable_objects": { "bindings": [{ "name": "HIVE_SIGNER_DO", "class_name": "HiveSigner" }] },
+  "migrations": [{ "tag": "v1-hive-signer", "new_sqlite_classes": ["HiveSigner"] }],
+  "vars": {
+    // The escrow NEAR account (the same value as bakeland-api's BAKELAND_NEAR_HIVE_ESCROW).
+    "ESCROW_ACCOUNT_ID": "<escrow>.near",
+    "NEAR_RPC_URL": "https://rpc.mainnet.fastnear.com",
+    // Limits in yocto wNEAR (1 NEAR = 10^24). An order is at most 10 USDC, so one transfer never needs more than that
+    // much NEAR; adjust both with the NEAR price. 5 NEAR per transfer, 50 NEAR per rolling 24 h.
+    "MAX_TRANSFER_YOCTO": "5000000000000000000000000",
+    "DAILY_MAX_YOCTO": "50000000000000000000000000",
+    // Solana side (15 Nov 2026): USDC out of the lootbox treasury for Hive payouts and refunds. Its key is the secret
+    // TREASURY_SOLANA_SECRET_KEY (the treasury wallet's 64-byte secret), refused unless it belongs to
+    // this address. SOLANA_RPC_URL may be set as a secret to use a private RPC instead of the public one.
+    "TREASURY_SOLANA_ADDRESS": "<treasury-solana-address>",
+    // Payouts are grouped to at least 5 USDC and one order is at most 10 USDC: 25 USDC per transfer, 200 per 24 h.
+    "MAX_USDC_TRANSFER_MICROS": "25000000",
+    "DAILY_MAX_USDC_MICROS": "200000000",
+    "SOLANA_PRIORITY_MICROLAMPORTS": "50000"
+  }
+}

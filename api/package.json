@@ -1,0 +1,19 @@
+{
+  "name": "bakeland-hive-near-api",
+  "private": true,
+  "type": "module",
+  "description": "Bakeland Hive Link: NEAR Intents routes, settlement sweep and the isolated signer Worker",
+  "scripts": {
+    "test": "node --test near-intents/*.test.js hive-signer/*.test.js"
+  },
+  "engines": { "node": ">=22.5" },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.902.0",
+    "@aws-sdk/lib-dynamodb": "^3.902.0",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "ethers": "^6.13.0",
+    "express": "^5.1.0"
+  }
+}
