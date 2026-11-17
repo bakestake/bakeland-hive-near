@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using Gamegaard.FarmSystem;
+using SpacetimeDB.Types;
 using UnityEngine;
 
 namespace Bakeland.HiveLink
@@ -9,7 +10,15 @@ namespace Bakeland.HiveLink
     /// <summary>
     /// A Hive worker droid standing by a Hive Link terminal (HX-07 TILLER, sheet DroidTiller in the B44 droid rig).
     /// The kiosk's worker and the local, visual-only farm preview.
+    ///
+    /// Paid jobs (15 Nov 2026): the server's scheduler does the real farming (HiveJobs.cs RunHiveJob), and this droid
+    /// acts it out on the farm like a player would. Each crop the server plants (a new MyHiveJobPlants row) queues a
+    /// visit: the droid walks to that plot, tills and plants it, and only then does the crop show (it is hidden until
+    /// the droid arrives). Each crop the server harvests leaves a ripe stand-in on its plot until the droid walks over
+    /// and harvests it. Between those it makes watering rounds over the plots it tends, and it walks back to the
+    /// kiosk once the job is over and its queue is done.
     /// </summary>
+    [DefaultExecutionOrder(10000)]   // its LateUpdate hides not-yet-planted crops after the farm's own renderers update
     public sealed class HiveDroidAgent : MonoBehaviour
     {
         // B44 slots
@@ -51,12 +60,17 @@ namespace Bakeland.HiveLink
         {
             HiveLinkPanel.Contracted += OnContracted;
             HiveJobNetwork.Changed += OnJobsChanged;
+            HiveJobNetwork.PlantStarted += OnPlantStarted;
+            HiveJobNetwork.PlantEnded += OnPlantEnded;
         }
         private void OnDisable()
         {
             HiveLinkPanel.Contracted -= OnContracted;
             HiveJobNetwork.Changed -= OnJobsChanged;
+            HiveJobNetwork.PlantStarted -= OnPlantStarted;
+            HiveJobNetwork.PlantEnded -= OnPlantEnded;
             serverGig = false;
+            StopLive();
             StopFarm();
             onGig = false;
             if (badge != null) badge.OnGig = false;
@@ -79,24 +93,201 @@ namespace Bakeland.HiveLink
             bool active = HiveJobNetwork.IsReady && HiveJobNetwork.HasActiveJob(siteId);
             if (active == serverGig) return;
             serverGig = active;
-            SetGig(active);
+            // Starting: off to the farm. Ending: the live loop finishes its queue (the last harvests), then walks home.
+            if (active) SetGig(true);
+        }
+
+        // ------------------------------------------------------------------ paid jobs, acted out on the farm
+
+        private enum TaskKind { Plant, Harvest }
+        private struct FarmTask { public TaskKind kind; public uint tile; }
+        private readonly Queue<FarmTask> tasks = new Queue<FarmTask>();
+        // Crops the server planted that the droid hasn't planted on screen yet: hidden until it does (or a time limit).
+        private readonly Dictionary<uint, float> hiddenUntil = new Dictionary<uint, float>();
+        private readonly Dictionary<uint, HashSet<Renderer>> hiddenRenderers = new Dictionary<uint, HashSet<Renderer>>();
+        // Crops the server harvested that the droid hasn't harvested on screen yet: a ripe stand-in sprite.
+        private readonly Dictionary<uint, SpriteRenderer> ghosts = new Dictionary<uint, SpriteRenderer>();
+        private readonly Dictionary<uint, Soil> soils = new Dictionary<uint, Soil>();
+        private Coroutine liveRoutine;
+        private int waterCursor;
+        private const float HideLimit = 60f;
+
+        private bool IsMySite(HiveJobPlant row) => row != null && HiveJobNetwork.JobById(row.JobId)?.Site == siteId;
+
+        private void OnPlantStarted(HiveJobPlant row)
+        {
+            if (!IsMySite(row)) return;
+            hiddenUntil[row.TileIndex] = Time.time + HideLimit;
+            tasks.Enqueue(new FarmTask { kind = TaskKind.Plant, tile = row.TileIndex });
+            EnsureLive();
+        }
+
+        private void OnPlantEnded(HiveJobPlant row)
+        {
+            if (!IsMySite(row) || !isActiveAndEnabled) return;
+            StartCoroutine(AfterPlantEnded(row));
+        }
+
+        private IEnumerator AfterPlantEnded(HiveJobPlant row)
+        {
+            // The farm removes its plant in the same server update; give it a couple of frames.
+            yield return null; yield return null;
+            Reveal(row.TileIndex);
+            Soil soil = SoilAt(row.TileIndex);
+            if (soil == null || soil.HasPlant) yield break;   // handed to the player when the job ended: nothing to harvest
+            var job = HiveJobNetwork.JobById(row.JobId);
+            Sprite ripe = job != null ? RipeSprite(job.SeedItemId) : null;
+            if (ripe != null && !ghosts.ContainsKey(row.TileIndex))
+            {
+                var visual = new GameObject("Hive ripe crop");
+                visual.transform.SetParent(soil.transform, false);
+                var sr = visual.AddComponent<SpriteRenderer>();
+                if (body != null) { sr.sharedMaterial = body.sharedMaterial; sr.sortingLayerID = body.sortingLayerID; }
+                sr.sprite = ripe;
+                ghosts[row.TileIndex] = sr;
+            }
+            tasks.Enqueue(new FarmTask { kind = TaskKind.Harvest, tile = row.TileIndex });
+            EnsureLive();
+        }
+
+        private static Sprite RipeSprite(int seedItemId)
+        {
+            var phases = ItemDatabaseManager.Instance != null ? ItemDatabaseManager.Instance.Find(seedItemId)?.PlantData?.Phases : null;
+            if (phases == null || phases.Length == 0) return null;
+            PlantPhase phase = phases.LastOrDefault(p => p != null && p.CanHarvest && p.States != null && p.States.Length > 0)
+                ?? phases[phases.Length - 1];
+            if (phase?.States == null || phase.States.Length == 0) return null;
+            return phase.States[0].sprite != null ? phase.States[0].sprite : phase.States[0].frames?.FirstOrDefault();
+        }
+
+        private Soil SoilAt(uint tile)
+        {
+            if (soils.TryGetValue(tile, out Soil s) && s != null) return s;
+            soils.Clear();
+            foreach (Soil candidate in FindObjectsOfType<Soil>())
+                if (candidate.gameObject.scene == gameObject.scene && candidate.TryGetFarmTileIndex(out uint index)) soils[index] = candidate;
+            return soils.TryGetValue(tile, out s) ? s : null;
+        }
+
+        private void EnsureLive()
+        {
+            if (liveRoutine != null || !isActiveAndEnabled) return;
+            StopFarm();   // a paid job replaces the visual-only preview
+            onGig = true;
+            if (badge != null) badge.OnGig = true;
+            liveRoutine = StartCoroutine(LiveWork());
+        }
+
+        private void StopLive()
+        {
+            if (liveRoutine != null) StopCoroutine(liveRoutine);
+            liveRoutine = null;
+            tasks.Clear();
+            foreach (uint tile in hiddenUntil.Keys.ToList()) Reveal(tile);
+            foreach (var g in ghosts.Values) if (g != null) Destroy(g.gameObject);
+            ghosts.Clear();
+        }
+
+        private IEnumerator LiveWork()
+        {
+            PreviewStage = "HEADING TO THE FARM";
+            while (true)
+            {
+                if (tasks.Count > 0)
+                {
+                    FarmTask task = tasks.Dequeue();
+                    if (task.kind == TaskKind.Plant)
+                    {
+                        yield return Visit(task.tile, "PLANTING", 0, 1.4f);
+                        Reveal(task.tile);
+                        yield return FarmAction("WATERING", 1, 1f);
+                    }
+                    else
+                    {
+                        yield return Visit(task.tile, "HARVESTING", 2, 1.4f);
+                        if (ghosts.TryGetValue(task.tile, out SpriteRenderer ghost) && ghost != null) Destroy(ghost.gameObject);
+                        ghosts.Remove(task.tile);
+                    }
+                    continue;
+                }
+                if (!serverGig) break;
+                var tended = HiveJobNetwork.TendedAt(siteId).Where(p => !hiddenUntil.ContainsKey(p.TileIndex)).ToList();
+                if (tended.Count > 0)
+                {
+                    // A watering round, one plot at a time, like a player with a can.
+                    var plot = tended[waterCursor++ % tended.Count];
+                    yield return Visit(plot.TileIndex, "WATERING", 1, 1.6f);
+                    yield return FarmAction("TENDING", 3, Random.Range(.8f, 1.6f));
+                }
+                else yield return FarmAction("WAITING FOR THE NEXT ROUND", 3, 1.5f);
+            }
+            PreviewStage = "RETURNING TO THE KIOSK";
+            yield return WalkRoute(home);
+            if (!arrived) transform.position = home;   // no route back: don't leave it stranded on the farm
+            mode = Mode.Idle; facing = IdleDown; modeUntil = Time.time + 3f;
+            onGig = false;
+            if (badge != null) badge.OnGig = false;
+            PreviewStage = null;
+            liveRoutine = null;
+        }
+
+        /// <summary>Walks to just below a plot (where a player stands to work it) and plays one farming action.</summary>
+        private IEnumerator Visit(uint tile, string stage, int action, float seconds)
+        {
+            Soil soil = SoilAt(tile);
+            if (soil == null) yield break;
+            PreviewStage = stage;
+            yield return WalkRoute((Vector2)soil.transform.position + Vector2.down * .55f);
+            if (!arrived)
+            {
+                // No route (a fence, the player in the way): step straight there rather than act from afar.
+                Vector3 p = (Vector2)soil.transform.position + Vector2.down * .55f;
+                transform.position = new Vector3(p.x, p.y, home.z);
+            }
+            yield return FarmAction(stage, action, seconds);
+        }
+
+        private void Reveal(uint tile)
+        {
+            hiddenUntil.Remove(tile);
+            if (hiddenRenderers.TryGetValue(tile, out var set)) foreach (var r in set) if (r != null) r.enabled = true;
+            hiddenRenderers.Remove(tile);
+        }
+
+        private void LateUpdate()
+        {
+            if (hiddenUntil.Count == 0) return;
+            foreach (uint tile in hiddenUntil.Keys.ToList())
+            {
+                if (Time.time > hiddenUntil[tile]) { Reveal(tile); continue; }
+                Soil soil = SoilAt(tile);
+                if (soil == null || soil.Plant == null) continue;
+                if (!hiddenRenderers.TryGetValue(tile, out var set)) hiddenRenderers[tile] = set = new HashSet<Renderer>();
+                foreach (Renderer r in soil.Plant.GetComponentsInChildren<Renderer>(true))
+                    if (r.enabled) { set.Add(r); r.enabled = false; }
+            }
         }
 
         private void OnContracted(string site, string droid)
         {
+            // A paid job drives the droid from the server's own planting and harvests (OnJobsChanged, OnPlantStarted);
+            // only the PREVIEW build plays the visual-only demo round.
+            if (HiveLinkPanel.Live) return;
             if (site != siteId || droid != droidId || onGig) return;
             onGig = true;
             if (badge != null) badge.OnGig = true;
             farmRoutine = StartCoroutine(PreviewFarm());
         }
 
-        /// <summary>Puts the droid on (or off) a gig: amber badge and the work loop.</summary>
+        /// <summary>Puts the droid on a gig (off to the farm to work the job's plots) or, off, sends it straight home.</summary>
         public void SetGig(bool gig)
         {
+            if (gig) { EnsureLive(); return; }
+            StopLive();
             StopFarm();
-            onGig = gig;
-            if (badge != null) badge.OnGig = gig;
-            mode = gig ? Mode.Work : Mode.Return;
+            onGig = false;
+            if (badge != null) badge.OnGig = false;
+            mode = Mode.Return;
             workStarted = Time.time; workAction = 3; modeUntil = Time.time + 3f;
         }
 
@@ -242,7 +433,7 @@ namespace Bakeland.HiveLink
                     return;
                 case Mode.Work:
                     // gig loop most of the time, a farming move now and then (a preview of what it will do on the plot)
-                    if (farmRoutine == null && t > modeUntil)
+                    if (farmRoutine == null && liveRoutine == null && t > modeUntil)
                     {
                         workAction = workAction == 3 ? Random.Range(0, 3) : 3;
                         modeUntil = t + (workAction == 3 ? Random.Range(2.5f, 4.5f) : 4f / Fps * 2f);

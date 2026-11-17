@@ -25,6 +25,12 @@ namespace Bakeland.HiveLink
 
         public static bool IsReady { get; private set; }
         public static event Action Changed;
+        /// <summary>The server's droid planted a crop for a job (a new MyHiveJobPlants row), live only (not the rows the
+        /// subscription starts with). The kiosk's droid walks there and plants it on screen (HiveDroidAgent).</summary>
+        public static event Action<HiveJobPlant> PlantStarted;
+        /// <summary>A job's crop left the droid's care: harvested (the farm plant is gone) or handed to the player when the
+        /// job ended (the plant stays).</summary>
+        public static event Action<HiveJobPlant> PlantEnded;
 
         private static DbConnection attached;
         // MyHiveJobs is a view (no primary key): an update arrives as delete + insert. Keep the newest row per job.
@@ -81,6 +87,18 @@ namespace Bakeland.HiveLink
         public static HiveJob OpenJobAt(string site) => Jobs().FirstOrDefault(j => j.Site == site && IsOpen(j));
 
         public static bool HasActiveJob(string site) => jobs.Values.Any(j => j.Site == site && j.Status == Active);
+
+        public static HiveJob JobById(ulong jobId) => jobs.TryGetValue(jobId, out HiveJob job) ? job : null;
+
+        /// <summary>Farm tiles a droid is tending for the caller's jobs at a site.</summary>
+        public static List<HiveJobPlant> TendedAt(string site)
+        {
+            var list = new List<HiveJobPlant>();
+            if (!IsReady || attached == null) return list;
+            foreach (HiveJobPlant p in attached.Db.MyHiveJobPlants.Iter())
+                if (JobById(p.JobId)?.Site == site) list.Add(p);
+            return list;
+        }
 
         public static HiveCropRate RateFor(uint plantIndex)
         {
@@ -178,8 +196,8 @@ namespace Bakeland.HiveLink
             attached = conn;
             conn.Db.MyHiveJobs.OnInsert += HandleInsert;
             conn.Db.MyHiveJobs.OnDelete += HandleDelete;
-            conn.Db.MyHiveJobPlants.OnInsert += HandlePlantsChanged;
-            conn.Db.MyHiveJobPlants.OnDelete += HandlePlantsChanged;
+            conn.Db.MyHiveJobPlants.OnInsert += HandlePlantInsert;
+            conn.Db.MyHiveJobPlants.OnDelete += HandlePlantDelete;
             conn.Reducers.OnCreateHiveJob += HandleCreated;
             conn.Reducers.OnCancelHiveJob += HandleCancelled;
             try
@@ -205,8 +223,8 @@ namespace Bakeland.HiveLink
             {
                 attached.Db.MyHiveJobs.OnInsert -= HandleInsert;
                 attached.Db.MyHiveJobs.OnDelete -= HandleDelete;
-                attached.Db.MyHiveJobPlants.OnInsert -= HandlePlantsChanged;
-                attached.Db.MyHiveJobPlants.OnDelete -= HandlePlantsChanged;
+                attached.Db.MyHiveJobPlants.OnInsert -= HandlePlantInsert;
+                attached.Db.MyHiveJobPlants.OnDelete -= HandlePlantDelete;
                 attached.Reducers.OnCreateHiveJob -= HandleCreated;
                 attached.Reducers.OnCancelHiveJob -= HandleCancelled;
             }
@@ -246,7 +264,17 @@ namespace Bakeland.HiveLink
             Changed?.Invoke();
         }
 
-        private static void HandlePlantsChanged(EventContext context, HiveJobPlant row) => Changed?.Invoke();
+        private static void HandlePlantInsert(EventContext context, HiveJobPlant row)
+        {
+            if (IsReady) PlantStarted?.Invoke(row);
+            Changed?.Invoke();
+        }
+
+        private static void HandlePlantDelete(EventContext context, HiveJobPlant row)
+        {
+            if (IsReady) PlantEnded?.Invoke(row);
+            Changed?.Invoke();
+        }
 
         private static void HandleCreated(ReducerEventContext context, string clientJobId, string site, string droidId,
             uint plantIndex, uint target)
